@@ -24,29 +24,136 @@ const BlockEntityType = block_entity.BlockEntityType;
 const sbb = main.server.terrain.structure_building_blocks;
 const blueprint = main.blueprint;
 const Assets = main.assets.Assets;
+const Feature = @import("features.zig").Feature;
+const FeatureList = @import("features.zig").FeatureList;
+
+var arenaAllocator = main.heap.NeverFailingArenaAllocator.init(main.globalAllocator);
+const arena = arenaAllocator.allocator();
 
 pub const maxBlockCount: usize = 65536; // 16 bit limit
+
+var size: u32 = 0;
+
+pub fn init() void { 
+	_onTick = .init(main.globalAllocator);
+	_onTouch = .init(main.globalAllocator);
+}
+
+pub fn reset() void {
+	size = 0;
+	meshes.reset();
+	_ = arenaAllocator.reset(.free_all);
+	reverseIndices = .{};
+	_onTick.clear();
+	_onTouch.clear();
+}
+
+pub fn deinit() void {
+    arenaAllocator.deinit();
+	_onTick.deinit();
+	_onTouch.deinit();
+}
 
 pub const BlockDrop = struct {
 	items: []const items.ItemStack,
 	chance: f32,
 };
 
-/// Ores can be found underground in veins.
-/// TODO: Add support for non-stone ores.
-pub const Ore = struct {
-	/// average size of a vein in blocks
-	size: f32,
-	/// average density of a vein
-	density: f32,
-	/// average veins per chunk
-	veins: f32,
-	/// maximum height this ore can be generated
-	maxHeight: i32,
-	minHeight: i32,
+const panicMsg = "Out of memory when allocating in LogicContainer! Increase maxBlockLogic in launchConfig.";
 
-	blockType: u16,
+fn less(target: u32, candidate: u32) std.math.Order {
+	if(target == candidate) return .eq;
+	if(target < candidate) return .lt;
+	return .gt;
+}
+
+// MARK: Logic Container
+fn LogicContainer(comptime DataType: type) type {
+	return struct {
+		const Self = @This();
+		pub const isLogicContainer = true;
+		pub const PropertyDataType = DataType;
+
+		allocator: std.mem.Allocator,
+		idxLookup: std.ArrayList(u32) = undefined,
+		data: std.ArrayList(std.ArrayList(DataType)) = undefined,
+
+		pub fn init(allocator: std.mem.Allocator) Self {
+			return .{
+				.allocator = allocator,
+				.idxLookup = std.ArrayList(u32).init(allocator),
+				.data = std.ArrayList(std.ArrayList(DataType)).init(allocator),
+			};
+		}
+
+		pub fn deinit(self: *Self) void {
+			for(self.data.items) |*list| {
+				list.deinit();
+			}
+			self.idxLookup.deinit();
+			self.data.deinit();
+		}
+
+		fn getIdx(self: *Self, blockId: u32) ?usize {
+			const slice = self.idxLookup.items;
+
+			const result = std.sort.binarySearch(
+				u32,
+				slice,
+				blockId,
+				less,
+			);
+
+			return result;
+		}
+
+		pub fn get(self: *Self, blockId: u32) ?[]const DataType {
+			const idx = self.getIdx(blockId) orelse return null;
+			return self.data.items[idx].items;
+		}
+
+		pub fn add(self: *Self, blockId: u32, propVal: DataType) void {
+			const slice = self.idxLookup.items;
+
+			if(self.getIdx(blockId)) |idx| {
+				self.data.items[idx].append(propVal) catch @panic(panicMsg);
+			} else {
+				const insertIdx = std.sort.lowerBound(u32, slice, blockId, less);
+
+				var newList = std.ArrayList(DataType).init(self.allocator);
+				newList.append(propVal) catch @panic(panicMsg);
+
+				self.idxLookup.insert(insertIdx, blockId) catch @panic(panicMsg);
+				self.data.insert(insertIdx, newList) catch @panic(panicMsg);
+			}
+		}
+
+		pub fn clear(self: *Self) void {
+			for(self.data.items) |*list| {
+				list.deinit();
+			}
+			self.idxLookup.clearRetainingCapacity();
+			self.data.clearRetainingCapacity();
+		}
+	};
+}
+
+pub const OnTouchFunction = *const fn(block: Block, entity: Entity, posX: i32, posY: i32, posZ: i32, isEntityInside: bool) void;
+pub const OnTouchFunctions = LogicContainer(OnTouchFunction);
+
+pub const OnTickFunction = *const fn(block: Block, _chunk: *chunk.ServerChunk, x: i32, y: i32, z: i32) void;
+pub const OnTickEvent = struct {
+	function: OnTickFunction,
+	chance: f32,
+
+	pub fn tryRandomTick(self: *const OnTickEvent, block: Block, _chunk: *chunk.ServerChunk, x: i32, y: i32, z: i32) void {
+		if(self.chance >= 1.0 or main.random.nextFloat(&main.seed) < self.chance) {
+			self.function(block, _chunk, x, y, z);
+		}
+	}
 };
+
+pub  const OnTickEvents = LogicContainer(OnTickEvent);
 
 var _transparent: [maxBlockCount]bool = undefined;
 var _collide: [maxBlockCount]bool = undefined;
@@ -82,15 +189,14 @@ var _terminalVelocity: [maxBlockCount]f32 = undefined;
 var _mobility: [maxBlockCount]f32 = undefined;
 
 var _allowOres: [maxBlockCount]bool = undefined;
-var _tickEvent: [maxBlockCount]?TickEvent = undefined;
-var _touchFunction: [maxBlockCount]?*const TouchFunction = undefined;
+
 var _blockEntity: [maxBlockCount]?*BlockEntityType = undefined;
 
+var _onTick: OnTickEvents = undefined;
+var _onTouch: OnTouchFunctions = undefined;
+
+var _features: [maxBlockCount]?FeatureList = undefined;
 var reverseIndices: std.StringHashMapUnmanaged(u16) = .{};
-
-var size: u32 = 0;
-
-pub var ores: main.ListUnmanaged(Ore) = .{};
 
 pub fn register(_: []const u8, id: []const u8, zon: ZonElement) u16 {
 	_id[size] = main.worldArena.dupe(u8, id);
@@ -125,32 +231,19 @@ pub fn register(_: []const u8, id: []const u8, zon: ZonElement) u16 {
 	_terminalVelocity[size] = zon.get(f32, "terminalVelocity", 90);
 	_mobility[size] = zon.get(f32, "mobility", 1.0);
 	_allowOres[size] = zon.get(bool, "allowOres", false);
-	_tickEvent[size] = TickEvent.loadFromZon(zon.getChild("tickEvent"));
-
-	_touchFunction[size] = if(zon.get(?[]const u8, "touchFunction", null)) |touchFunctionName| blk: {
-		const _function = touchFunctions.getFunctionPointer(touchFunctionName);
-		if(_function == null) {
-			std.log.err("Could not find TouchFunction {s}!", .{touchFunctionName});
-		}
-		break :blk _function;
-	} else null;
 
 	_blockEntity[size] = block_entity.getByID(zon.get(?[]const u8, "blockEntity", null));
 
-	const oreProperties = zon.getChild("ore");
-	if(oreProperties != .null) blk: {
-		if(!std.mem.eql(u8, zon.get([]const u8, "rotation", "cubyz:no_rotation"), "cubyz:ore")) {
-			std.log.err("Ore must have rotation mode \"cubyz:ore\"!", .{});
-			break :blk;
+	for(Feature.getRegisteredFeatures()) |*featureClass| {
+		const featureZon = zon.getChild(featureClass.name);
+		if(featureZon != .null) {
+			 if(_features[size] == null) {
+				_features[size] = FeatureList.init(arena);
+			}
+
+			var featureList = &(_features[size].?);
+			_ = featureList.append(featureClass, @intCast(size), featureZon);
 		}
-		ores.append(main.worldArena, .{
-			.veins = oreProperties.get(f32, "veins", 0),
-			.size = oreProperties.get(f32, "size", 0),
-			.maxHeight = oreProperties.get(i32, "height", 0),
-			.minHeight = oreProperties.get(i32, "minHeight", std.math.minInt(i32)),
-			.density = oreProperties.get(f32, "density", 0.5),
-			.blockType = @intCast(size),
-		});
 	}
 
 	defer size += 1;
@@ -220,13 +313,6 @@ pub fn finishBlocks(zonElements: Assets.ZonHashMap) void {
 		registerOpaqueVariant(i, zonElements.get(_id[i]) orelse continue);
 	}
 	blueprint.registerVoidBlock(parseBlock("cubyz:void"));
-}
-
-pub fn reset() void {
-	size = 0;
-	ores = .{};
-	reverseIndices = .{};
-	meshes.reset();
 }
 
 pub fn getTypeById(id: []const u8) u16 {
@@ -418,65 +504,30 @@ pub const Block = packed struct { // MARK: Block
 		return _allowOres[self.typ];
 	}
 
-	pub inline fn tickEvent(self: Block) ?TickEvent {
-		return _tickEvent[self.typ];
+	pub inline fn tickEvents(self: Block) ?[]const OnTickEvent {
+		return _onTick.get(self.typ);
 	}
 
-	pub inline fn touchFunction(self: Block) ?*const TouchFunction {
-		return _touchFunction[self.typ];
+	pub inline fn touchFunctions(self: Block) ?[]const OnTouchFunction {
+		return _onTouch.get(self.typ);
 	}
 
 	pub fn blockEntity(self: Block) ?*BlockEntityType {
 		return _blockEntity[self.typ];
 	}
 
+	pub fn feature(self: Block, featureType: type) ?*Feature {
+		if(_features[self.typ]) |list| {
+			return list.find(featureType);
+		} else {
+			return null;
+		}
+	}
+
 	pub fn canBeChangedInto(self: Block, newBlock: Block, item: main.items.ItemStack, shouldDropSourceBlockOnSuccess: *bool) main.rotation.RotationMode.CanBeChangedInto {
 		return newBlock.mode().canBeChangedInto(self, newBlock, item, shouldDropSourceBlockOnSuccess);
 	}
 };
-
-// MARK: Tick
-pub var tickFunctions: utils.NamedCallbacks(TickFunctions, TickFunction) = undefined;
-pub const TickFunction = fn(block: Block, _chunk: *chunk.ServerChunk, x: i32, y: i32, z: i32) void;
-pub const TickFunctions = struct {
-	pub fn replaceWithCobble(block: Block, _chunk: *chunk.ServerChunk, x: i32, y: i32, z: i32) void {
-		std.log.debug("Replace with cobblestone at ({d},{d},{d})", .{x, y, z});
-		const cobblestone = parseBlock("cubyz:cobblestone");
-
-		const wx = _chunk.super.pos.wx + x;
-		const wy = _chunk.super.pos.wy + y;
-		const wz = _chunk.super.pos.wz + z;
-
-		_ = main.server.world.?.cmpxchgBlock(wx, wy, wz, block, cobblestone);
-	}
-};
-
-pub const TickEvent = struct {
-	function: *const TickFunction,
-	chance: f32,
-
-	pub fn loadFromZon(zon: ZonElement) ?TickEvent {
-		const functionName = zon.get(?[]const u8, "name", null) orelse return null;
-
-		const function = tickFunctions.getFunctionPointer(functionName) orelse {
-			std.log.err("Could not find TickFunction {s}.", .{functionName});
-			return null;
-		};
-
-		return TickEvent{.function = function, .chance = zon.get(f32, "chance", 1)};
-	}
-
-	pub fn tryRandomTick(self: *const TickEvent, block: Block, _chunk: *chunk.ServerChunk, x: i32, y: i32, z: i32) void {
-		if(self.chance >= 1.0 or main.random.nextFloat(&main.seed) < self.chance) {
-			self.function(block, _chunk, x, y, z);
-		}
-	}
-};
-
-// MARK: Touch
-pub var touchFunctions: utils.NamedCallbacks(TouchFunctions, TouchFunction) = undefined;
-pub const TouchFunction = fn(block: Block, entity: Entity, posX: i32, posY: i32, posZ: i32, isEntityInside: bool) void;
-pub const TouchFunctions = struct {};
 
 pub const meshes = struct { // MARK: meshes
 	const AnimationData = extern struct {

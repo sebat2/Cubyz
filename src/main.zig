@@ -24,6 +24,7 @@ pub const renderer = @import("renderer.zig");
 pub const rotation = @import("rotation.zig");
 pub const settings = @import("settings.zig");
 pub const particles = @import("particles.zig");
+pub const Features = @import("features.zig");
 const tag = @import("tag.zig");
 pub const Tag = tag.Tag;
 pub const utils = @import("utils.zig");
@@ -500,6 +501,9 @@ pub fn main() void { // MARK: main()
 
 	std.log.info("Starting game client with version {s}", .{settings.version.version});
 
+	utils.initDynamicIntArrayStorage();
+	defer utils.deinitDynamicIntArrayStorage();
+
 	gui.initWindowList();
 	defer gui.deinitWindowList();
 
@@ -521,14 +525,14 @@ pub fn main() void { // MARK: main()
 	Window.init();
 	defer Window.deinit();
 
+	Features.init();
+	defer Features.deinit();
+
 	graphics.init();
 	defer graphics.deinit();
 
 	audio.init() catch std.log.err("Failed to initialize audio. Continuing the game without sounds.", .{});
 	defer audio.deinit();
-
-	utils.initDynamicIntArrayStorage();
-	defer utils.deinitDynamicIntArrayStorage();
 
 	chunk.init();
 	defer chunk.deinit();
@@ -538,12 +542,6 @@ pub fn main() void { // MARK: main()
 
 	block_entity.init();
 	defer block_entity.deinit();
-
-	blocks.tickFunctions = .init();
-	defer blocks.tickFunctions.deinit();
-
-	blocks.touchFunctions = .init();
-	defer blocks.touchFunctions.deinit();
 
 	models.init();
 	defer models.deinit();
