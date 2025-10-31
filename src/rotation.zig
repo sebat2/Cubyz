@@ -163,7 +163,7 @@ pub const RotationMode = struct { // MARK: RotationMode
 	canBeChangedInto: *const fn(oldBlock: Block, newBlock: Block, item: main.items.ItemStack, shouldDropSourceBlockOnSuccess: *bool) CanBeChangedInto = DefaultFunctions.canBeChangedInto,
 };
 
-var rotationModes: std.StringHashMap(RotationMode) = undefined;
+var rotationModes: std.StringHashMap(RotationMode) = .init(main.globalAllocator.allocator);
 
 pub fn rotationMatrixTransform(quad: *main.models.QuadInfo, transformMatrix: Mat4f) void {
 	quad.normal = vec.xyz(Mat4f.mulVec(transformMatrix, vec.combine(quad.normal, 0)));
@@ -175,7 +175,6 @@ pub fn rotationMatrixTransform(quad: *main.models.QuadInfo, transformMatrix: Mat
 // MARK: init/register
 
 pub fn init() void {
-	rotationModes = .init(main.globalAllocator.allocator);
 	inline for(@typeInfo(list).@"struct".decls) |declaration| {
 		register(declaration.name, @field(list, declaration.name));
 	}

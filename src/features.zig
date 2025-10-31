@@ -1,84 +1,70 @@
 const std = @import("std");
 
 const main = @import("main");
-const blockFeaturesList = @import("block_features/index.zig");
+const featuresList = @import("features/index.zig");
 const ZonElement = @import("zon.zig").ZonElement;
 
-pub fn init() void {
-	registeredFeatures = .init(main.globalAllocator.allocator);
+var registeredBlockFeatures: std.ArrayList(BlockFeatureFactory) = undefined;
 
-	inline for (@typeInfo(blockFeaturesList).@"struct".decls) |decl| {
-		@field(blockFeaturesList, decl.name).initFeature();
-	}
-}
-
-pub fn reset() void {
-	inline for (@typeInfo(blockFeaturesList).@"struct".decls) |decl| {
-		@field(blockFeaturesList, decl.name).resetFeature();
-	}
-
-	registeredFeatures.clearAndFree();
-}
-
-pub fn deinit() void {
-	inline for (@typeInfo(blockFeaturesList).@"struct".decls) |decl| {
-		@field(blockFeaturesList, decl.name).deinitFeature();
-	}
-
-	registeredFeatures.clearAndFree();
-}
-
-var registeredFeatures: std.ArrayList(FeatureFactory) = undefined;
 pub const FeatureId = u32;
 const TypeId = u64;
 
-fn typeId(comptime T: type) TypeId {
-    return comptime std.hash.Wyhash.hash(0, @typeName(T));
+fn allocAlignedSlice(allocator: std.mem.Allocator, alignment: usize, len: usize) ![]u8 {
+	const ptr = allocator.rawAlloc(len, std.mem.Alignment.fromByteUnits(alignment), @returnAddress()) 
+		orelse unreachable; // out of memory
+	return ptr[0..len];
 }
 
-pub const FeatureFactory = struct {
+pub fn init() void {
+	registeredBlockFeatures = .init(main.globalAllocator.allocator);
+
+	inline for (@typeInfo(featuresList).@"struct".decls) |decl| {
+		@field(featuresList, decl.name).initFeature();
+	}
+}
+
+pub fn OnUnloadAssets() void {
+	inline for (@typeInfo(featuresList).@"struct".decls) |decl| {
+		@field(featuresList, decl.name).OnUnloadAssets();
+	}
+}
+
+pub fn deinit() void {
+	inline for (@typeInfo(featuresList).@"struct".decls) |decl| {
+		@field(featuresList, decl.name).deinitFeature();
+	}
+
+	registeredBlockFeatures.clearAndFree();
+}
+
+const FeatureTypeData = struct {
 	const Self = @This();
-	const ConstructorFn = *const fn(feature: *Feature, blockId: u16, zon: ZonElement) void;
-	const VTable = struct {
-		constructor: ConstructorFn,
-	};
 
 	var numFeatureClasses: FeatureId = 0;
 
-	Id: FeatureId,
-	vtable: VTable = undefined,
+	id: FeatureId,
 	name: []const u8,
 	dependancy: [][]const u8,
+
 	implSize: usize,
-	implAlign: u8,
-	implTypeId: TypeId,
+	implAlign: usize,
 	implTypeName: []const u8,
-	
-	pub inline fn init(comptime inFeatureName: []const u8, comptime ImplType: type, inConstructor: ConstructorFn) Self {
-		return blk: {
-			const newInstance = Self {
-				.Id = Self.numFeatureClasses,
-				.vtable = .{ 
-					.constructor = inConstructor
-				},
-				.name = inFeatureName,
-				.dependancy = undefined,
-				.implSize = @sizeOf(ImplType),
-				.implAlign = @intCast(@alignOf(ImplType)),
-				.implTypeId = comptime typeId(ImplType),
-				.implTypeName = comptime @typeName(ImplType)
-			};
 
-			Self.numFeatureClasses += 1;
-
-			break :blk newInstance;
+	fn init(comptime inFeatureName: []const u8, comptime ImplType: type) Self {
+		const newInstance = Self{
+			.id = numFeatureClasses,
+			.name = inFeatureName,
+			.dependancy = undefined,
+			.implSize = @sizeOf(ImplType),
+			.implAlign = @alignOf(ImplType),
+			.implTypeName = comptime @typeName(ImplType),
 		};
+
+		numFeatureClasses += 1;
+
+		return newInstance;
 	}
-	
-	fn getMaxAlign(self: *const Self) usize {
-		return @max(@alignOf(Feature), self.implAlign);
-	}
-	
+
 	fn getImplOffset(self: *const Self) usize {
 		return std.mem.alignForward(usize, @sizeOf(Feature), self.implAlign);
 	}
@@ -86,79 +72,49 @@ pub const FeatureFactory = struct {
 	fn getTotalSize(self: *const Self) usize {
 		return self.getImplOffset() + self.implSize;
 	}
-	
-	fn initFeature(self: *const Self, feature: *Feature) void {
-		feature.* = .{
-			.implTypeId = self.implTypeId,
-			.implSize = self.implSize,
-			.implAlign = self.implAlign,
-			.classId = self.Id,
-		};
+
+	fn getMaxAlign(self: *const Self) usize {
+		return @max(@alignOf(Feature), self.implAlign);
 	}
 
-	fn new(self: *Self, allocator: main.heap.NeverFailingAllocator, blockId: u16, zon: ZonElement) *Feature {
+	fn alloc(self: *const Self, allocator: std.mem.Allocator) !*Feature {
 		const totalSize = self.getTotalSize();
-		const mem = allocator.alignedAlloc(u8, self.getMaxAlign(), totalSize) catch unreachable;
+		const mem = try allocAlignedSlice(allocator, self.getMaxAlign(), totalSize);
 		
 		const feature: *Feature = @ptrCast(@alignCast(mem.ptr));
-		self.initFeature(feature);
+		feature.runtimetypeInfo = self;
 		
 		@memset(mem[self.getImplOffset()..totalSize], 0);
-		
-		self.vtable.constructor(feature, blockId, zon);
+
 		return feature;
 	}
 
-	fn free(feature: *Feature, allocator: main.heap.NeverFailingAllocator) void {
-		const mem: [*]u8 = @ptrCast(feature);
-		allocator.free(mem[0..feature.getTotalSize()]);
+	pub fn initInPlace(self: *const Self, mem: [*]u8) *Feature {
+		const feature: *Feature = @ptrCast(@alignCast(mem));
+		feature.runtimetypeInfo = self;
+		
+		const implOffset = self.getImplOffset();
+		const totalSize = self.getTotalSize();
+		@memset(mem[implOffset..totalSize], 0);
+
+		return feature;
 	}
 };
 
 pub const Feature = struct {
 	const Self = @This();
 	
-	implTypeId: TypeId,
-	implSize: usize,
-	implAlign: u8,
-	classId: FeatureId,
-
-    pub fn getRegisteredFeatures() []const FeatureFactory {
-        return registeredFeatures.items;
-    }
-	
-	fn getImplOffset(self: *const Self) usize {
-		return std.mem.alignForward(usize, @sizeOf(Feature), self.implAlign);
-	}
-	
-	fn getTotalSize(self: *const Self) usize {
-		return self.getImplOffset() + self.implSize;
-	}
-	
-	fn getImplPtr(self: *Self) [*]u8 {
-		const mem: [*]u8 = @ptrCast(self);
-		return mem + self.getImplOffset();
-	}
+	runtimetypeInfo: *const FeatureTypeData,
 	
 	pub fn cast(self: *Self, comptime ImplType: type) *ImplType {
-		if (self.implTypeId != comptime typeId(ImplType)) {
+		if (!std.mem.eql(u8, self.runtimetypeInfo.implTypeName, @typeName(ImplType))) {
 			@branchHint(.cold);
 
-			var featureClass: ?*FeatureFactory = null;
-			for (registeredFeatures.items) |*fc| {
-				if (fc.Id == self.classId) {
-					featureClass = fc;
-					break;
-				}
-			}
-			
-			if (featureClass) |fc| {
-				std.debug.panic("Cannot cast feature '{s}' from type '{s}' to type '{s}'", .{
-					fc.name,
-					fc.implTypeName,
-					@typeName(ImplType)
-				});
-			} else unreachable;
+			std.debug.panic("Cannot cast feature '{s}' from type '{s}' to type '{s}'", .{
+				self.runtimetypeInfo.name,
+				self.runtimetypeInfo.implTypeName,
+				@typeName(ImplType),
+			});
 		}
 		
 		const implOffset = std.mem.alignForward(usize, @sizeOf(Feature), @alignOf(ImplType));
@@ -167,98 +123,189 @@ pub const Feature = struct {
 	}
 };
 
-pub fn registerFeature(featureClass: FeatureFactory) FeatureId {
-	registeredFeatures.append(featureClass) catch unreachable;
-	return featureClass.Id;
-}
-
-pub const FeatureList = struct {
+pub const FeatureListBase = struct {
 	const Self = @This();
 	
-	allocator: main.heap.NeverFailingAllocator,
-	memory: ?[*]u8,
-	allocatedMemory: ?[]u8,
+	allocator: std.mem.Allocator,
+	memory: ?[]u8,
 	totalSize: usize,
-	count: usize,
+	capacity: usize,
+	featureCount: usize,
+	storageAlignment: usize,
 	
-	pub fn init(allocator: main.heap.NeverFailingAllocator) Self {
+	pub fn init(allocator: std.mem.Allocator) Self {
 		return .{
-			.memory = null,
-			.allocatedMemory = null,
-			.count = 0,
-			.totalSize = 0,
 			.allocator = allocator,
+			.memory = null,
+			.totalSize = 0,
+			.capacity = 0,
+			.featureCount = 0,
+			.storageAlignment = @alignOf(Feature),
 		};
 	}
 	
 	pub fn deinit(self: *Self) void {
 		if (self.memory) |mem| {
-			self.allocator.free(mem[0..self.totalSize]);
+			self.allocator.free(mem);
 			self.memory = null;
 		}
-		self.count = 0;
 		self.totalSize = 0;
+		self.capacity = 0;
+		self.featureCount = 0;
+		self.storageAlignment = @alignOf(Feature);
 	}
 	
-	pub fn append(self: *Self, featureClass: *const FeatureFactory, blockId: u16, zon: ZonElement) *Feature {
-		const featureBlockSize = featureClass.getTotalSize();
-		const maxAlign = featureClass.getMaxAlign();
-		const oldSize = self.totalSize;
+	fn appendFeature(self: *Self, featureFactory: *const BlockFeatureFactory) *Feature {
+		const featureSize = featureFactory.typeData.getTotalSize();
+		const featureAlign = featureFactory.typeData.getMaxAlign();
+		const newAlignment = @max(self.storageAlignment, featureAlign);
+		
+		const alignedOffset = std.mem.alignForward(usize, self.totalSize, featureAlign);
+		const requiredSize = alignedOffset + featureSize;
 
-		const extraPadding = maxAlign - 1;
-		const allocSize = oldSize + featureBlockSize + extraPadding;
+		const needsRealloc = self.memory == null or 
+			requiredSize > self.capacity or 
+			newAlignment > self.storageAlignment;
 		
-		const rawMemory = self.allocator.alloc(u8, allocSize);
-		
-		const alignedStart = std.mem.alignForward(usize, @intFromPtr(rawMemory.ptr), maxAlign);
-		const aligned = rawMemory.ptr + (alignedStart - @intFromPtr(rawMemory.ptr));
-		
-		if (self.memory) |oldMem| {
-			@memcpy(aligned[0..oldSize], oldMem[0..oldSize]);
-			if (self.allocatedMemory) |oldAlloc| {
-				self.allocator.free(oldAlloc);
+		if (needsRealloc) {
+			const newCapacity = requiredSize * 2;
+			const newMem = allocAlignedSlice(self.allocator, newAlignment, newCapacity) catch unreachable;
+			
+			if (self.memory) |oldMem| {
+				@memcpy(newMem[0..self.totalSize], oldMem[0..self.totalSize]);
+				self.allocator.free(oldMem);
 			}
+			
+			self.memory = newMem;
+			self.capacity = newCapacity;
+			self.storageAlignment = newAlignment;
 		}
+
+		const featurePtr = featureFactory.typeData.initInPlace(self.memory.?.ptr + alignedOffset);
 		
-		const newFeaturePtr: *Feature = @ptrCast(@alignCast(aligned + oldSize));
-		featureClass.initFeature(newFeaturePtr);
+		self.totalSize = requiredSize;
+		self.featureCount += 1;
 		
-		@memset(aligned[oldSize + featureClass.getImplOffset()..oldSize + featureBlockSize], 0);
-		
-		featureClass.vtable.constructor(newFeaturePtr, blockId, zon);
-		
-		self.memory = aligned;
-		self.allocatedMemory = rawMemory;
-		self.count += 1;
-		self.totalSize = oldSize + featureBlockSize;
-		
-		return newFeaturePtr;
+		return featurePtr;
 	}
 	
-	pub fn get(self: *Self, index: usize) ?*Feature {
-		if (index >= self.count or self.memory == null) return null;
+	pub fn find(self: *Self, comptime FeatureType: type) ?*FeatureType {
+		if (self.memory == null or self.featureCount == 0) return null;
+		const targetTypeName = @typeName(FeatureType);
 		
-		var offset: usize = 0;
-		var i: usize = 0;
-		while (i < index) : (i += 1) {
-			const feature: *Feature = @ptrCast(@alignCast(self.memory.? + offset));
-			offset += feature.getTotalSize();
-		}
+		var currentOffset: usize = 0;
+		var index: usize = 0;
 		
-		return @ptrCast(@alignCast(self.memory.? + offset));
-	}
-	
-	pub fn find(self: *Self, featureType: type) ?*Feature {
-		if (self.memory == null) return null;
-		
-		var offset: usize = 0;
-		var i: usize = 0;
-		while (i < self.count) : (i += 1) {
-			const feature: *Feature = @ptrCast(@alignCast(self.memory.? + offset));
-			if (feature.classId == featureType.classId) return feature;
-			offset += feature.getTotalSize();
+		while (index < self.featureCount) {
+			const feature: *Feature = @ptrCast(@alignCast(self.memory.?.ptr + currentOffset));
+
+			if (std.mem.eql(u8, feature.runtimetypeInfo.implTypeName, targetTypeName)) {
+				return feature.cast(FeatureType);
+			}
+			
+			const typeData = feature.runtimetypeInfo;
+			const featureSize = typeData.getTotalSize();
+			const featureAlign = typeData.getMaxAlign();
+			currentOffset = std.mem.alignForward(usize, currentOffset + featureSize, featureAlign);
+			index += 1;
 		}
 		
 		return null;
 	}
+
+	pub inline fn forEach(self: *Self, bodyFn: anytype) void {
+		if (self.memory == null or self.featureCount == 0) return;
+
+		var currentOffset: usize = 0;
+		var index: usize = 0;
+
+		while (index < self.featureCount) {
+			const feature: *Feature = @ptrCast(@alignCast(self.memory.?.ptr + currentOffset));
+
+			if (bodyFn(feature)) return;
+
+			const typeData = feature.runtimetypeInfo;
+			const featureSize = typeData.getTotalSize();
+			const featureAlign = typeData.getMaxAlign();
+			currentOffset = std.mem.alignForward(usize, currentOffset + featureSize, featureAlign);
+			index += 1;
+		}
+	}
 };
+
+pub const BlockFeatureFactory = struct {
+	const Self = @This();
+	const RegisterBlockFn = *const fn(feature: *Feature, blockId: u16, zon: ZonElement) void;
+	const VTable = struct {
+		registerBlock: RegisterBlockFn,
+	};
+
+	typeData: FeatureTypeData = undefined,
+	vtable: VTable = undefined,
+
+	pub inline fn init(comptime inFeatureName: []const u8, comptime ImplType: type, inRegisterFn: RegisterBlockFn) Self {
+		return Self{
+			.vtable = .{ 
+				.registerBlock = inRegisterFn,
+			},
+			.typeData = .init(inFeatureName, ImplType),
+		};
+	}
+
+	fn new(self: *Self, allocator: std.mem.Allocator, blockId: u16, zon: ZonElement) *Feature {
+		const feature = self.typeData.alloc(allocator) catch unreachable;
+		self.vtable.registerBlock(feature, blockId, zon);
+		return feature;
+	}
+
+	pub fn newInPlace(self: *const Self, memory: [*]u8, blockId: u16, zon: ZonElement) *Feature {
+		const feature = self.typeData.initInPlace(memory);
+		self.vtable.registerBlock(feature, blockId, zon);
+		return feature;
+	}
+	
+	fn free(feature: *Feature, allocator: std.mem.Allocator) void {
+		const totalSize = feature.runtimetypeInfo.getTotalSize();
+		const mem: [*]u8 = @ptrCast(feature);
+		allocator.free(mem[0..totalSize]);
+	}
+};
+
+pub const BlockFeatureList = struct {
+	const Self = @This();
+	
+	base: FeatureListBase,
+	
+	pub fn init(allocator: std.mem.Allocator) Self {
+		return .{
+			.base = FeatureListBase.init(allocator),
+		};
+	}
+	
+	pub fn deinit(self: *Self) void {
+		self.base.deinit();
+	}
+	
+	pub fn registerBlock(self: *Self, featureFactory: *const BlockFeatureFactory, blockId: u16, zon: ZonElement) *Feature {
+		const feature = self.base.appendFeature(featureFactory);
+		featureFactory.vtable.registerBlock(feature, blockId, zon);
+		return feature;
+	}
+	
+	pub fn find(self: *Self, comptime FeatureType: type) ?*FeatureType {
+		return self.base.find(FeatureType);
+	}
+
+	pub inline fn forEach(self: *Self, bodyFn: anytype) void {
+		self.base.forEach(bodyFn);
+	}
+};
+
+pub fn registerBlockFeature(featureClass: BlockFeatureFactory) FeatureId {
+	registeredBlockFeatures.append(featureClass) catch unreachable;
+	return featureClass.typeData.id;
+}
+
+pub fn getRegisteredBlockFeatures() []BlockFeatureFactory {
+	return registeredBlockFeatures.items;
+}

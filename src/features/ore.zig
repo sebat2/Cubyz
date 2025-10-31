@@ -2,8 +2,13 @@ const std = @import("std");
 
 const main = @import("main");
 const Blocks = @import("../blocks.zig");
-const Rotation = @import("../rotation.zig");
+const RotationSystem = @import("../rotation.zig");
 const Features = @import("../features.zig");
+
+const RotationMode = RotationSystem.RotationMode;
+const Neighbor = main.chunk.Neighbor;
+const Block = main.blocks.Block;
+const ModelIndex = main.models.ModelIndex;
 const ZonElement = main.ZonElement;
 const random = main.random;
 const terrain = main.server.terrain;
@@ -14,7 +19,6 @@ const Vec3d = vec.Vec3d;
 const Vec3f = vec.Vec3f;
 const Vec3i = vec.Vec3i;
 
-
 /// Ores can be found underground in veins.
 /// TODO: Add support for non-stone ores.
 const Self = @This();
@@ -24,15 +28,19 @@ var _id: Features.FeatureId = std.math.maxInt(Features.FeatureId);
 
 pub fn initFeature() void {
     ores = .init(main.globalAllocator.allocator);
-    _id = Features.registerFeature(Features.FeatureFactory.init("ore", Self, constructor));
+    _id = Features.registerBlockFeature(Features.BlockFeatureFactory.init("ore", Self, registerBlock));
     terrain.BlockGenerator.registerGenerator(OreGenerator);
+
+    RotationSystem.register("cubyz:ore", Rotation);
 }
 
 pub fn deinitFeature() void {
+    Rotation.deinit();
     ores.clearAndFree();
 }
 
-pub fn resetFeature() void {
+pub fn OnUnloadAssets() void {
+    Rotation.reset();
     ores.clearAndFree();
 }
 
@@ -52,9 +60,9 @@ minHeight: i32,
 
 blockType: u16,
 
-fn constructor(instance: *Features.Feature, blockId: u16, zon: ZonElement) void {
+fn registerBlock(instance: *Features.Feature, blockId: u16, zon: ZonElement) void {
     var feature = instance.cast(Self);
-    if((Blocks.Block{.typ =  blockId, .data = 0}).mode() !=  Rotation.getByID("cubyz:ore")) {
+    if((Blocks.Block{.typ =  blockId, .data = 0}).mode() !=  RotationSystem.getByID("cubyz:ore")) {
         std.log.err("Ore must have rotation mode \"cubyz:ore\"!", .{});
         return;
     }
@@ -170,5 +178,65 @@ const OreGenerator = struct {
                 }
             }
         }
+    }
+};
+
+const Rotation = struct {
+    var modelCache: ?ModelIndex = null;
+
+    pub fn init() void {}
+    pub fn deinit() void {}
+    pub fn reset() void {
+        modelCache = null;
+    }
+
+    pub fn createBlockModel(_: Block, _: *u16, zon: ZonElement) ModelIndex {
+        const modelId = zon.as([]const u8, "cubyz:cube");
+        if(!std.mem.eql(u8, modelId, "cubyz:cube")) {
+            std.log.err("Ores can only be use on cube models, found '{s}'", .{modelId});
+        }
+        if(modelCache) |modelIndex| return modelIndex;
+
+        const baseModel = main.models.getModelIndex("cubyz:cube").model();
+        var quadList = main.List(main.models.QuadInfo).init(main.stackAllocator);
+        defer quadList.deinit();
+        baseModel.getRawFaces(&quadList);
+        const len = quadList.items.len;
+        for(0..len) |i| {
+            quadList.append(quadList.items[i]);
+            quadList.items[i + len].textureSlot += 16;
+            quadList.items[i].opaqueInLod = 2;
+        }
+        const modelIndex = main.models.Model.init(quadList.items);
+        modelCache = modelIndex;
+        return modelIndex;
+    }
+
+    pub fn generateData(_: *main.game.World, _: Vec3i, _: Vec3f, _: Vec3f, _: Vec3i, _: ?Neighbor, _: *Block, _: Block, _: bool) bool {
+        return false;
+    }
+
+    pub fn modifyBlock(block: *Block, newBlockType: u16) bool {
+        if(block.transparent() or block.viewThrough()) return false;
+        if(!main.blocks.meshes.modelIndexStart(block.*).model().allNeighborsOccluded) return false;
+        if(block.data != 0) return false;
+        block.data = block.typ;
+        block.typ = newBlockType;
+        return true;
+    }
+
+    pub fn canBeChangedInto(oldBlock: Block, newBlock: Block, _: main.items.ItemStack, shouldDropSourceBlockOnSuccess: *bool) RotationMode.CanBeChangedInto {
+        if(oldBlock == newBlock) return .no;
+        if(oldBlock.transparent() or oldBlock.viewThrough()) return .no;
+        if(!main.blocks.meshes.modelIndexStart(oldBlock).model().allNeighborsOccluded) return .no;
+        if(oldBlock.data != 0) return .no;
+        if(newBlock.data != oldBlock.typ) return .no;
+        shouldDropSourceBlockOnSuccess.* = false;
+        return .{.yes_costsItems = 1};
+    }
+
+    pub fn onBlockBreaking(_: ?main.items.Item, _: Vec3f, _: Vec3f, currentData: *Block) void {
+        currentData.typ = currentData.data;
+        currentData.data = 0;
     }
 };

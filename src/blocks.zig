@@ -24,7 +24,7 @@ const BlockEntityType = block_entity.BlockEntityType;
 const sbb = main.server.terrain.structure_building_blocks;
 const blueprint = main.blueprint;
 const Assets = main.assets.Assets;
-const Feature = @import("features.zig").Feature;
+const Features = @import("features.zig");
 const FeatureList = @import("features.zig").FeatureList;
 
 var arenaAllocator = main.heap.NeverFailingArenaAllocator.init(main.globalAllocator);
@@ -35,8 +35,8 @@ pub const maxBlockCount: usize = 65536; // 16 bit limit
 var size: u32 = 0;
 
 pub fn init() void { 
-	_onTick = .init(main.globalAllocator);
-	_onTouch = .init(main.globalAllocator);
+	_onTick = .init(main.globalAllocator.allocator);
+	_onTouch = .init(main.globalAllocator.allocator);
 }
 
 pub fn reset() void {
@@ -46,12 +46,16 @@ pub fn reset() void {
 	reverseIndices = .{};
 	_onTick.clear();
 	_onTouch.clear();
+
+	@memset(&_features, null);
 }
 
 pub fn deinit() void {
     arenaAllocator.deinit();
 	_onTick.deinit();
 	_onTouch.deinit();
+
+	@memset(&_features, null);
 }
 
 pub const BlockDrop = struct {
@@ -195,7 +199,7 @@ var _blockEntity: [maxBlockCount]?*BlockEntityType = undefined;
 var _onTick: OnTickEvents = undefined;
 var _onTouch: OnTouchFunctions = undefined;
 
-var _features: [maxBlockCount]?FeatureList = undefined;
+var _features: [maxBlockCount]?Features.BlockFeatureList = undefined;
 var reverseIndices: std.StringHashMapUnmanaged(u16) = .{};
 
 pub fn register(_: []const u8, id: []const u8, zon: ZonElement) u16 {
@@ -234,15 +238,17 @@ pub fn register(_: []const u8, id: []const u8, zon: ZonElement) u16 {
 
 	_blockEntity[size] = block_entity.getByID(zon.get(?[]const u8, "blockEntity", null));
 
-	for(Feature.getRegisteredFeatures()) |*featureClass| {
-		const featureZon = zon.getChild(featureClass.name);
+	for(Features.getRegisteredBlockFeatures()) |*featureClass| {
+		const featureZon = zon.getChild(featureClass.typeData.name);
 		if(featureZon != .null) {
 			 if(_features[size] == null) {
-				_features[size] = FeatureList.init(arena);
+				_features[size] = Features.BlockFeatureList.init(arena.allocator);
 			}
 
 			var featureList = &(_features[size].?);
-			_ = featureList.append(featureClass, @intCast(size), featureZon);
+			for(0..size) |_| {
+			_ = featureList.registerBlock(featureClass, @intCast(size), featureZon);
+			}
 		}
 	}
 
@@ -516,8 +522,8 @@ pub const Block = packed struct { // MARK: Block
 		return _blockEntity[self.typ];
 	}
 
-	pub fn feature(self: Block, featureType: type) ?*Feature {
-		if(_features[self.typ]) |list| {
+	pub fn feature(self: Block, featureType: type) ?*featureType {
+		if(_features[self.typ]) |*list| {
 			return list.find(featureType);
 		} else {
 			return null;

@@ -8,6 +8,7 @@ const Blueprint = blueprints_zig.Blueprint;
 const particles_zig = @import("particles.zig");
 const ZonElement = @import("zon.zig").ZonElement;
 const main = @import("main");
+const Features = @import("features.zig");
 const biomes_zig = main.server.terrain.biomes;
 const sbb = main.server.terrain.structure_building_blocks;
 const NeverFailingAllocator = main.heap.NeverFailingAllocator;
@@ -658,6 +659,8 @@ pub fn unloadAssets() void { // MARK: unloadAssets()
 	main.particles.ParticleManager.reset();
 	main.rotation.reset();
 	main.Tag.resetTags();
+
+	Features.OnUnloadAssets();
 
 	// Remove paths from asset hot reloading:
 	var dir = main.files.cwd().openIterableDir("assets") catch |err| {
